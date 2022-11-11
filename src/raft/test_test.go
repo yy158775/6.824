@@ -218,6 +218,7 @@ func TestFailNoAgree2B(t *testing.T) {
 
 	cfg.begin("Test (2B): no agreement if too many followers disconnect")
 
+	// 1 commit
 	cfg.one(10, servers, false)
 
 	// 3 of 5 followers disconnect
@@ -226,10 +227,14 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
 
+	fmt.Printf("DisConnect:%d\n",(leader + 1) % servers)
+
+	// 2 commit
 	index, _, ok := cfg.rafts[leader].Start(20)
 	if ok != true {
 		t.Fatalf("leader rejected Start()")
 	}
+	// 2
 	if index != 2 {
 		t.Fatalf("expected index 2, got %v", index)
 	}
@@ -245,10 +250,13 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
+	fmt.Printf("Connect:%d\n",(leader + 1) % servers)
 
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
 	leader2 := cfg.checkOneLeader()
+	fmt.Printf("Leader:%d\n",leader2)
+
 	index2, _, ok2 := cfg.rafts[leader2].Start(30)
 	if ok2 == false {
 		t.Fatalf("leader2 rejected Start()")
