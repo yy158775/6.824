@@ -540,40 +540,39 @@ func (rf *Raft) sendHeartbeat(term int) {
 	// should be Leader
 	args.Term = term
 	args.LeadId = rf.me
-
-	for rf.killed() == false {
-		rf.mu.Lock()
-		// terminate the goroutine
-		// pay attention to the leader condition
-		if rf.state != StateLeader || rf.currentTerm != args.Term {
-			rf.mu.Unlock()
-			return
-		}
-		args.LeaderCommit = rf.commitIndex
-		rf.mu.Unlock()
-
-		// even if here the rf is not the Leader
-		// it is not affect the result
-		// commitIndex:only the commitIdx to be sent to the server
-		// heartbeat
-		for id := range rf.peers {
-			if id == rf.me {
+	for id := range rf.peers {
+		go func(serverId int) {
+			for rf.killed() == false {
 				rf.mu.Lock()
-				rf.heartBeat = true
+				// terminate the goroutine
+				// pay attention to the leader condition
+				if rf.state != StateLeader || rf.currentTerm != args.Term {
+					rf.mu.Unlock()
+					return
+				}
+				args.LeaderCommit = rf.commitIndex
 				rf.mu.Unlock()
-				continue
-			}
-			server := id
 
-			rf.mu.Lock()
-			args.PrevLogIndex = rf.matchIndex[server]
-			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-			serverArgs := args
-			rf.mu.Unlock()
+				// even if here the rf is not the Leader
+				// it is not affect the result
+				// commitIndex:only the commitIdx to be sent to the server
+				// heartbeat
+				if serverId == rf.me {
+					rf.mu.Lock()
+					rf.heartBeat = true
+					rf.mu.Unlock()
+					time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
+					continue
+				}
 
-			go func() {
+				rf.mu.Lock()
+				args.PrevLogIndex = rf.matchIndex[serverId]
+				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+				serverArgs := args
+				rf.mu.Unlock()
+
 				reply := AppendEntriesReply{}
-				ok := rf.sendAppendEntries(server, &serverArgs, &reply)
+				ok := rf.sendAppendEntries(serverId, &serverArgs, &reply)
 				if !ok {
 					return
 				}
@@ -582,9 +581,9 @@ func (rf *Raft) sendHeartbeat(term int) {
 					rf.becomeFollower(reply.Term)
 				}
 				rf.mu.Unlock()
-			}()
-		}
-		time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
+				time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
+			}
+		}(id)
 	}
 }
 
