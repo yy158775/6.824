@@ -20,6 +20,8 @@ package raft
 import (
 	"fmt"
 	"math/rand"
+	"path/filepath"
+	"runtime"
 	"time"
 	//	"bytes"
 	"sync"
@@ -203,7 +205,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// heartbeat
-
+	PDebug(file_line(), args)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -230,9 +232,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 
-		//fmt.Printf("Peer:%d to be leader\n", args.CandidateId)
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		// P4 Followers
 		rf.heartBeat = true
 		return
 	}
@@ -293,34 +295,45 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//fmt.Printf("Peer:%d len(logs):%d commit:%d Sender:%d,term:%d,sender commit:%d\n", rf.me, len(rf.log), rf.commitIndex, args.LeadId, args.Term, args.LeaderCommit)
-	//fmt.Printf("sender logs:%v\n", args.Entries)
-	//fmt.Printf("receiver logs:%v\n", rf.log)
 	defer func() {
 		// every peer send to applyCh
 		// leader commit but peer not get the entry
-		if args.LeaderCommit > rf.commitIndex && args.PrevLogIndex == len(rf.log)-1 && len(args.Entries) == 0 {
-			size := len(rf.log)
-			commitIndex := minInt(size-1, args.LeaderCommit)
-			idx := rf.commitIndex + 1
-			for idx <= commitIndex {
-				msg := ApplyMsg{}
-				msg.CommandValid = true
-				msg.CommandIndex = idx
-				msg.Command = rf.log[idx].Date
-				rf.applyCh <- msg
-				idx++
+		if args.LeaderCommit > rf.commitIndex {
+			if !reply.Success {
+				return
 			}
-			rf.commitIndex = commitIndex
+			// pay attention to the condition rf.commitIndex
+			go func() {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				commitIndex := minInt(args.PrevLogIndex, args.LeaderCommit)
+				idx := rf.commitIndex + 1
+				if idx > commitIndex {
+					return
+				}
+				for idx <= commitIndex {
+					msg := ApplyMsg{}
+					msg.CommandValid = true
+					msg.CommandIndex = idx
+					msg.Command = rf.log[idx].Date
+					rf.applyCh <- msg
+					idx++
+				}
+				rf.commitIndex = commitIndex
+			}()
 		}
 	}()
 
+	reply.Success = true
+
+	// 1
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
+	// 3  3 --> 1,2
 	// update rf.Term
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
@@ -329,29 +342,35 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	rf.heartBeat = true
 
-	size := len(rf.log)
-
+	// 4   4 --> 1,2
 	if len(args.Entries) == 0 {
 		// follower
 		if rf.state == StateCandidate {
 			rf.state = StateFollower
 		}
-		return
 	}
 
+	size := len(rf.log)
+
+	// 2
 	// lack of entry
 	if args.PrevLogIndex > size-1 {
 		reply.Success = false
 		return
 	}
 
-	if rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
-		// append
+	// conflict
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		rf.log = rf.log[:args.PrevLogIndex]
+		reply.Success = false
+		return
+	}
 
+	if reply.Success {
+		// append
 		for _, entry := range args.Entries {
 			if entry.Index <= len(rf.log)-1 {
 				if rf.log[entry.Index].Term != entry.Term {
-					//fmt.Printf("Peer:%d len(logs):%d delete entry before %d\n", rf.me, len(rf.log), entry.Index)
 					rf.log = rf.log[:entry.Index]
 					rf.log = append(rf.log, entry)
 				}
@@ -359,11 +378,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.log = append(rf.log, entry)
 			}
 		}
-		reply.Success = true
-		return
-	} else {
-		reply.Success = false
-		rf.log = rf.log[:args.PrevLogIndex]
 	}
 
 	return
@@ -411,7 +425,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	entry.Index = index
 
 	rf.log = append(rf.log, entry)
-	//fmt.Printf("Leader:%d Term:%d,new entry:%d\n", rf.me, rf.currentTerm, entry.Index)
 	go rf.tryToCommitEntry(term, &entry)
 
 	return index, term, isLeader
@@ -442,13 +455,12 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
+		electionTimeout := (rand.Int() % ElectionTimeoutRange) + ElectionTimeoutBase
+		time.Sleep(time.Millisecond * time.Duration(electionTimeout))
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		electionTimeout := (rand.Int() % ElectionTimeoutRange) + ElectionTimeoutBase
-		time.Sleep(time.Millisecond * time.Duration(electionTimeout))
-		//fmt.Printf("peer:%d commitIdx:%d\n", rf.me, rf.commitIndex)
 		// start election
 		rf.mu.Lock()
 		// election
@@ -467,6 +479,7 @@ func (rf *Raft) ticker() {
 		entry := rf.log[len(rf.log)-1]
 		rf.mu.Unlock()
 
+		// pay attention to the entry condition
 		args.LastLogIndex = entry.Index
 		args.LastLogTerm = entry.Term
 		args.CandidateId = rf.me
@@ -506,32 +519,32 @@ func (rf *Raft) ticker() {
 				if int(count) > len(rf.peers)/2 {
 					rf.state = StateLeader
 					for sid := range rf.matchIndex {
-						rf.matchIndex[sid] = rf.commitIndex
-						rf.nextIndex[sid] = rf.commitIndex + 1
+						rf.matchIndex[sid] = len(rf.log) - 1
+						rf.nextIndex[sid] = len(rf.log)
 					}
-					//fmt.Printf("Peer:%d become Leader\n", rf.me)
+					// transfer the current term condition
+					go rf.sendHeartbeat(rf.currentTerm)
 					rf.mu.Unlock()
-					go rf.sendHeartbeat()
 					return
 				}
 				rf.mu.Unlock()
 			}()
 		}
 	}
-	//fmt.Printf("peer:%d Exit ticker\n", rf.me)
 }
 
-func (rf *Raft) sendHeartbeat() {
+func (rf *Raft) sendHeartbeat(term int) {
 	args := AppendEntriesArgs{}
 
-	rf.mu.Lock()
-	args.Term = rf.currentTerm
+	// pay attention to the condition
+	// should be Leader
+	args.Term = term
 	args.LeadId = rf.me
-	rf.mu.Unlock()
 
 	for rf.killed() == false {
 		rf.mu.Lock()
 		// terminate the goroutine
+		// pay attention to the leader condition
 		if rf.state != StateLeader || rf.currentTerm != args.Term {
 			rf.mu.Unlock()
 			return
@@ -539,8 +552,11 @@ func (rf *Raft) sendHeartbeat() {
 		args.LeaderCommit = rf.commitIndex
 		rf.mu.Unlock()
 
+		// even if here the rf is not the Leader
+		// it is not affect the result
+		// commitIndex:only the commitIdx to be sent to the server
+		// heartbeat
 		for id := range rf.peers {
-			//fmt.Printf("Send heartbeat Leader:%d To:%d commitIdx:%d\n", rf.me,id,rf.commitIndex)
 			if id == rf.me {
 				rf.mu.Lock()
 				rf.heartBeat = true
@@ -548,18 +564,21 @@ func (rf *Raft) sendHeartbeat() {
 				continue
 			}
 			server := id
+
 			rf.mu.Lock()
 			args.PrevLogIndex = rf.matchIndex[server]
-			hargs := args
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+			serverArgs := args
 			rf.mu.Unlock()
+
 			go func() {
 				reply := AppendEntriesReply{}
-				ok := rf.sendAppendEntries(server, &hargs, &reply)
+				ok := rf.sendAppendEntries(server, &serverArgs, &reply)
 				if !ok {
 					return
 				}
 				rf.mu.Lock()
-				if reply.Term > hargs.Term {
+				if reply.Term > serverArgs.Term {
 					rf.becomeFollower(reply.Term)
 				}
 				rf.mu.Unlock()
@@ -583,7 +602,6 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 	count := int32(1)
 
 	for id := range rf.peers {
-		//fmt.Printf("TrytoCommit Leader:%d\n",rf.me)
 		server := id
 		if server == rf.me {
 			continue
@@ -627,12 +645,10 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				if !ok {
 					return
 				}
-				fmt.Printf("Peer:%d sendAppend to %d\n", rf.me, server)
 				// because other has bigger than me
 				if reply.Term > args.Term {
 					rf.mu.Lock()
 					rf.becomeFollower(reply.Term)
-					fmt.Printf("Peer:%d become follower\n", rf.me)
 					rf.mu.Unlock()
 					return
 				}
@@ -736,4 +752,24 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return a
+}
+
+const IsDebug = false
+
+func PDebug(lineno string, arg interface{}) {
+	if IsDebug {
+		fmt.Printf("%s  %+v\n", lineno, arg)
+	}
+}
+
+func file_line() string {
+	_, fileName, fileLine, ok := runtime.Caller(1)
+	fileName = filepath.Base(fileName)
+	var s string
+	if ok {
+		s = fmt.Sprintf("%s:%d", fileName, fileLine)
+	} else {
+		s = ""
+	}
+	return s
 }
