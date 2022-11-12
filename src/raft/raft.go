@@ -205,9 +205,12 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// heartbeat
-	PDebug(file_line(), args)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	defer PDebug(file_line(),reply)
+	defer PDebug(file_line(),args)
+	PDebug(file_line(),rf)
 
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
@@ -221,7 +224,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 
-	if rf.votedFor == 0 || rf.votedFor == args.CandidateId {
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		rfLastTerm := rf.log[len(rf.log)-1].Term
 
 		if rfLastTerm > args.LastLogTerm {
@@ -473,7 +476,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 			continue
 		}
-
+		PDebug(file_line(),rf)
 		args := &RequestVoteArgs{}
 		args.Term = rf.currentTerm
 		entry := rf.log[len(rf.log)-1]
@@ -550,7 +553,8 @@ func (rf *Raft) sendHeartbeat(term int) {
 					rf.mu.Unlock()
 					return
 				}
-				args.LeaderCommit = rf.commitIndex
+				serverArgs := args
+				serverArgs.LeaderCommit = rf.commitIndex
 				rf.mu.Unlock()
 
 				// even if here the rf is not the Leader
@@ -566,21 +570,19 @@ func (rf *Raft) sendHeartbeat(term int) {
 				}
 
 				rf.mu.Lock()
-				args.PrevLogIndex = rf.matchIndex[serverId]
-				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-				serverArgs := args
+				serverArgs.PrevLogIndex = rf.matchIndex[serverId]
+				serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex].Term
 				rf.mu.Unlock()
 
 				reply := AppendEntriesReply{}
 				ok := rf.sendAppendEntries(serverId, &serverArgs, &reply)
-				if !ok {
-					return
+				if ok {
+					rf.mu.Lock()
+					if reply.Term > serverArgs.Term {
+						rf.becomeFollower(reply.Term)
+					}
+					rf.mu.Unlock()
 				}
-				rf.mu.Lock()
-				if reply.Term > serverArgs.Term {
-					rf.becomeFollower(reply.Term)
-				}
-				rf.mu.Unlock()
 				time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 			}
 		}(id)
@@ -593,7 +595,7 @@ func (rf *Raft) becomeFollower(term int) {
 	}
 	rf.currentTerm = term
 	rf.state = StateFollower
-	rf.votedFor = 0
+	rf.votedFor = -1
 	rf.heartBeat = true
 }
 
@@ -667,6 +669,10 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				}
 				rf.mu.Unlock()
 
+				// don't need to verify the rf's role
+				// even if the rf is a Follower currently
+				// the log has already spread the majority of the peers
+				// the Leader elected after that must have this new log
 				atomic.AddInt32(&count, 1)
 				if int(count) > len(rf.peers)/2 {
 					commitIndex := args.PrevLogIndex + len(args.Entries)
@@ -718,7 +724,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
-	rf.votedFor = 0
+	rf.votedFor = -1
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
