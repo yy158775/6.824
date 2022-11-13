@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"path/filepath"
@@ -40,7 +42,7 @@ const (
 	StateLeader
 )
 const (
-	ElectionTimeoutBase  int = 300
+	ElectionTimeoutBase  int = 400
 	ElectionTimeoutRange int = 400
 	HeartbeatTimeout     int = 150
 )
@@ -133,6 +135,24 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	err := e.Encode(rf.currentTerm)
+	if err != nil {
+		fmt.Println(err)
+	}
+	err = e.Encode(rf.votedFor)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	err = e.Encode(rf.log)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -155,6 +175,19 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var voteFor int
+	var log []Entry = make([]Entry, 0)
+
+	if d.Decode(&term) != nil || d.Decode(&voteFor) != nil || d.Decode(&log) != nil {
+		fmt.Println("readPersist failed")
+	} else {
+		rf.currentTerm = term
+		rf.votedFor = voteFor
+		rf.log = log
+	}
 }
 
 //
@@ -208,9 +241,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	defer PDebug(file_line(),reply)
-	defer PDebug(file_line(),args)
-	PDebug(file_line(),rf)
+	defer func() {
+		PDebug(file_line(),rf)
+		PDebug(file_line(),args)
+		PDebug(file_line(),reply)
+	}()
 
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
@@ -237,6 +272,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		rf.persist()
 		// P4 Followers
 		rf.heartBeat = true
 		return
@@ -299,6 +335,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer func() {
+		PDebug(file_line(),rf)
+		PDebug(file_line(),args)
+		PDebug(file_line(),reply)
+	}()
+
+	defer func() {
 		// every peer send to applyCh
 		// leader commit but peer not get the entry
 		if args.LeaderCommit > rf.commitIndex {
@@ -351,6 +393,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.state == StateCandidate {
 			rf.state = StateFollower
 		}
+		//PDebug(file_line(), rf)
+		//PDebug(file_line(), args)
+		//PDebug(file_line(), reply)
 	}
 
 	size := len(rf.log)
@@ -366,6 +411,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		rf.log = rf.log[:args.PrevLogIndex]
 		reply.Success = false
+		rf.persist()
 		return
 	}
 
@@ -381,6 +427,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.log = append(rf.log, entry)
 			}
 		}
+		rf.persist()
 	}
 
 	return
@@ -428,6 +475,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	entry.Index = index
 
 	rf.log = append(rf.log, entry)
+	rf.persist()
 	go rf.tryToCommitEntry(term, &entry)
 
 	return index, term, isLeader
@@ -471,12 +519,12 @@ func (rf *Raft) ticker() {
 			rf.state = StateCandidate
 			rf.currentTerm++
 			rf.votedFor = rf.me
+			rf.persist()
 		} else {
 			rf.heartBeat = false
 			rf.mu.Unlock()
 			continue
 		}
-		PDebug(file_line(),rf)
 		args := &RequestVoteArgs{}
 		args.Term = rf.currentTerm
 		entry := rf.log[len(rf.log)-1]
@@ -495,8 +543,8 @@ func (rf *Raft) ticker() {
 			server := id
 			go func() {
 				reply := RequestVoteReply{}
-				success := rf.sendRequestVote(server, args, &reply)
-				if !success {
+				ok := rf.sendRequestVote(server, args, &reply)
+				if !ok {
 					return
 				}
 
@@ -525,7 +573,6 @@ func (rf *Raft) ticker() {
 						rf.matchIndex[sid] = len(rf.log) - 1
 						rf.nextIndex[sid] = len(rf.log)
 					}
-					// transfer the current term condition
 					go rf.sendHeartbeat(rf.currentTerm)
 					rf.mu.Unlock()
 					return
@@ -577,11 +624,43 @@ func (rf *Raft) sendHeartbeat(term int) {
 				reply := AppendEntriesReply{}
 				ok := rf.sendAppendEntries(serverId, &serverArgs, &reply)
 				if ok {
-					rf.mu.Lock()
-					if reply.Term > serverArgs.Term {
-						rf.becomeFollower(reply.Term)
+					if !reply.Success {
+						if reply.Term > serverArgs.Term {
+							rf.mu.Lock()
+							rf.becomeFollower(reply.Term)
+							rf.mu.Unlock()
+							return
+						} else {
+							rf.mu.Lock()
+							rf.matchIndex[serverId] = serverArgs.PrevLogIndex - 1
+							rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+							rf.mu.Unlock()
+							continue
+						}
+					} else {
+						rf.mu.Lock()
+						if rf.nextIndex[serverId] <= len(rf.log)-1 {
+							serverArgs.PrevLogIndex = rf.matchIndex[serverId]
+							serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex].Term
+							entryArgs := serverArgs
+							idx := rf.nextIndex[serverId]
+							for idx < len(rf.log) {
+								entryArgs.Entries = append(entryArgs.Entries, rf.log[idx])
+								idx++
+							}
+							reply = AppendEntriesReply{}
+							rf.mu.Unlock()
+							ok := rf.sendAppendEntries(serverId, &entryArgs, &reply)
+							if ok && reply.Success {
+								rf.mu.Lock()
+								rf.matchIndex[serverId] = idx - 1
+								rf.nextIndex[serverId] = idx
+								rf.mu.Unlock()
+							}
+						} else {
+							rf.mu.Unlock()
+						}
 					}
-					rf.mu.Unlock()
 				}
 				time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 			}
@@ -596,7 +675,7 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.currentTerm = term
 	rf.state = StateFollower
 	rf.votedFor = -1
-	rf.heartBeat = true
+	rf.persist()
 }
 
 func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
@@ -613,6 +692,11 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				args.Term = term
 
 				rf.mu.Lock()
+				if rf.state != StateLeader {
+					rf.mu.Unlock()
+					return
+				}
+
 				// Raft already has new Entry
 				// Confirm the tryToCommitEntry have the same entries
 				// also confirm the matchIndex is the same
@@ -644,7 +728,8 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 
 				ok := rf.sendAppendEntries(server, &args, &reply)
 				if !ok {
-					return
+					time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
+					continue
 				}
 				// because other has bigger than me
 				if reply.Term > args.Term {
@@ -756,7 +841,7 @@ func maxInt(a, b int) int {
 	if a > b {
 		return a
 	}
-	return a
+	return b
 }
 
 const IsDebug = false

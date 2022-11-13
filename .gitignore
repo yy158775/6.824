@@ -1,0 +1,5 @@
+*.out
+notes
+.gitignore
+src/.gitignore
+.idea
