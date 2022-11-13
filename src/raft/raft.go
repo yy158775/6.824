@@ -42,10 +42,17 @@ const (
 	StateLeader
 )
 const (
-	ElectionTimeoutBase  int = 400
-	ElectionTimeoutRange int = 400
+	ElectionTimeoutBase  int = 700
+	ElectionTimeoutRange int = 700
 	HeartbeatTimeout     int = 150
 )
+
+// DecrementSpeed is used by Leader's matchIndex[server] to decrease value
+// when the prevLogIndex's log has conflict with the server.
+// TODO:
+// Forward searching to find the previous log
+// because the the number of log is not specific
+const DecrementSpeed int = 50
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -242,9 +249,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	defer func() {
-		PDebug(file_line(),rf)
-		PDebug(file_line(),args)
-		PDebug(file_line(),reply)
+		PDebug(file_line(), rf)
+		PDebug(file_line(), args)
+		PDebug(file_line(), reply)
 	}()
 
 	if rf.currentTerm > args.Term {
@@ -335,9 +342,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer func() {
-		PDebug(file_line(),rf)
-		PDebug(file_line(),args)
-		PDebug(file_line(),reply)
+		PDebug(file_line(), rf)
+		PDebug(file_line(), args)
+		PDebug(file_line(), reply)
 	}()
 
 	defer func() {
@@ -632,9 +639,10 @@ func (rf *Raft) sendHeartbeat(term int) {
 							return
 						} else {
 							rf.mu.Lock()
-							rf.matchIndex[serverId] = serverArgs.PrevLogIndex - 1
+							rf.matchIndex[serverId] = maxInt(serverArgs.PrevLogIndex-DecrementSpeed, 0)
 							rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
 							rf.mu.Unlock()
+							time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 							continue
 						}
 					} else {
@@ -741,9 +749,11 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 
 				if !reply.Success {
 					rf.mu.Lock()
-					rf.matchIndex[server] = args.PrevLogIndex - 1
-					rf.nextIndex[server] = args.PrevLogIndex
+					rf.matchIndex[server] = maxInt(args.PrevLogIndex-DecrementSpeed, 0)
+					rf.nextIndex[server] = rf.matchIndex[server] + 1
 					rf.mu.Unlock()
+					// in order to avoid hunger goroutines
+					//time.Sleep(time.Millisecond*10)
 					continue
 				}
 
