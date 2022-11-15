@@ -41,17 +41,24 @@ const (
 	StateCandidate
 	StateLeader
 )
+
+// ElectionTimeoutBase millisecond is the minimum election timeout.
+// ElectionTimeoutRange millisecond is used by the peer to randomized at the
+// start of an election.
+// ElectionTimeout is [ElectionTimeoutBase,ElectionTimeoutBase+ElectionTimeoutRange].
+// HeartbeatTimeout is the timeout for the heartbeat of the Leader sent to the follower
+// the tester limits you to 10 heartbeats per second
 const (
-	ElectionTimeoutBase  int = 700
-	ElectionTimeoutRange int = 700
+	ElectionTimeoutBase  int = 600
+	ElectionTimeoutRange int = 500
 	HeartbeatTimeout     int = 150
 )
 
 // DecrementSpeed is used by Leader's matchIndex[server] to decrease value
-// when the prevLogIndex's log has conflict with the server.
+// when the prevLogIndex's log has conflict with the follower.
 // TODO:
 // Forward searching to find the previous log
-// because the the number of log is not specific
+// because the the number of log is not specific.
 const DecrementSpeed int = 50
 
 //
@@ -103,8 +110,12 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	// heartbeat
+	// true indicates the peer has received heartbeat in the past period of time.
 	heartBeat bool
+
+	// globalHeartBeat is for measuring time interval only used in tests.
+	// such as the goroutine running's time interval or receiving heartbeat's time interval
+	globalHeartBeat time.Time
 }
 
 type Entry struct {
@@ -244,15 +255,8 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	// heartbeat
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	defer func() {
-		PDebug(file_line(), rf)
-		PDebug(file_line(), args)
-		PDebug(file_line(), reply)
-	}()
 
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
@@ -267,6 +271,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		// verify the candidate's log is at least up-to-date as receiver's log.
 		rfLastTerm := rf.log[len(rf.log)-1].Term
 
 		if rfLastTerm > args.LastLogTerm {
@@ -280,7 +285,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.persist()
-		// P4 Followers
+		// granting vote to candidate can be view as receiving heartbeat.
 		rf.heartBeat = true
 		return
 	}
@@ -341,20 +346,20 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer func() {
-		PDebug(file_line(), rf)
-		PDebug(file_line(), args)
-		PDebug(file_line(), reply)
-	}()
 
 	defer func() {
-		// every peer send to applyCh
-		// leader commit but peer not get the entry
+		// if the leaderCommit > commitIndex,set
+		// commitIndex = min(leaderCommit,index of the last new entry).
 		if args.LeaderCommit > rf.commitIndex {
+			// reply's Success indicates the peer's prevLogIndex and prevLogTerm matching the leader.
+			// so the last entry must be up-to-date with the leader.
+			// the previous conflicting entries has been deleted.
+			// we can safely commit the new entries.
 			if !reply.Success {
 				return
 			}
-			// pay attention to the condition rf.commitIndex
+			// because of the applyCh can be blocked so need to start a new goroutine
+			// and the entry need to be sent in order.
 			go func() {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
@@ -378,52 +383,49 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 
-	// 1
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	// 3  3 --> 1,2
-	// update rf.Term
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
 	}
 
 	reply.Term = rf.currentTerm
+	// the not-null entries also can make effect as the heartbeat.
 	rf.heartBeat = true
 
-	// 4   4 --> 1,2
+	// empty for heartbeat
 	if len(args.Entries) == 0 {
-		// follower
-		if rf.state == StateCandidate {
-			rf.state = StateFollower
-		}
-		//PDebug(file_line(), rf)
-		//PDebug(file_line(), args)
-		//PDebug(file_line(), reply)
+	}
+
+	// received the AppendEntries RPC from the new leader
+	// convert to the follower.
+	if rf.state == StateCandidate {
+		rf.state = StateFollower
 	}
 
 	size := len(rf.log)
 
-	// 2
-	// lack of entry
+	// lack of new entries
 	if args.PrevLogIndex > size-1 {
 		reply.Success = false
 		return
 	}
 
-	// conflict
+	// PrevLogIndex's log conflicts with a new one
+	// delete the existing entry and all that follow it.
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		rf.log = rf.log[:args.PrevLogIndex]
-		reply.Success = false
 		rf.persist()
+		reply.Success = false
 		return
 	}
 
 	if reply.Success {
-		// append
+		// Append new entries to the receiver's log.
 		for _, entry := range args.Entries {
 			if entry.Index <= len(rf.log)-1 {
 				if rf.log[entry.Index].Term != entry.Term {
@@ -519,10 +521,9 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		// start election
 		rf.mu.Lock()
-		// election
 		if !rf.heartBeat {
+			// start election
 			rf.state = StateCandidate
 			rf.currentTerm++
 			rf.votedFor = rf.me
@@ -537,7 +538,8 @@ func (rf *Raft) ticker() {
 		entry := rf.log[len(rf.log)-1]
 		rf.mu.Unlock()
 
-		// pay attention to the entry condition
+		// to verify the candidate's log is at least as up-to-date as with receiver
+		// definition is in the end of the Section 5.4.1
 		args.LastLogIndex = entry.Index
 		args.LastLogTerm = entry.Term
 		args.CandidateId = rf.me
@@ -568,11 +570,14 @@ func (rf *Raft) ticker() {
 				}
 
 				rf.mu.Lock()
+				// if the peer isn't StateCandidate and the term is changed
+				// we need to return immediately because the RequestVote is useless
 				if rf.state != StateCandidate || rf.currentTerm != args.Term {
 					rf.mu.Unlock()
 					return
 				}
 
+				// hold lock to ensure consistency
 				atomic.AddInt32(&count, 1)
 				if int(count) > len(rf.peers)/2 {
 					rf.state = StateLeader
@@ -580,6 +585,7 @@ func (rf *Raft) ticker() {
 						rf.matchIndex[sid] = len(rf.log) - 1
 						rf.nextIndex[sid] = len(rf.log)
 					}
+					// immediately send heartbeats
 					go rf.sendHeartbeat(rf.currentTerm)
 					rf.mu.Unlock()
 					return
@@ -590,19 +596,19 @@ func (rf *Raft) ticker() {
 	}
 }
 
+// term is the peer's turned into leader upon election used by
+// terminating the useless goroutine
 func (rf *Raft) sendHeartbeat(term int) {
 	args := AppendEntriesArgs{}
 
-	// pay attention to the condition
-	// should be Leader
 	args.Term = term
 	args.LeadId = rf.me
 	for id := range rf.peers {
 		go func(serverId int) {
 			for rf.killed() == false {
 				rf.mu.Lock()
-				// terminate the goroutine
-				// pay attention to the leader condition
+				// terminate the useless heartbeat goroutine
+				// if the peer's state has changed
 				if rf.state != StateLeader || rf.currentTerm != args.Term {
 					rf.mu.Unlock()
 					return
@@ -611,10 +617,10 @@ func (rf *Raft) sendHeartbeat(term int) {
 				serverArgs.LeaderCommit = rf.commitIndex
 				rf.mu.Unlock()
 
-				// even if here the rf is not the Leader
-				// it is not affect the result
-				// commitIndex:only the commitIdx to be sent to the server
-				// heartbeat
+				// even if here the peer is not the leader,
+				// sending one more heartbeat doesn't affect the cluster's state
+				// because of the serverArgs term is not changed.
+				// so we release the lock.
 				if serverId == rf.me {
 					rf.mu.Lock()
 					rf.heartBeat = true
@@ -630,6 +636,10 @@ func (rf *Raft) sendHeartbeat(term int) {
 
 				reply := AppendEntriesReply{}
 				ok := rf.sendAppendEntries(serverId, &serverArgs, &reply)
+				// TODO:
+				// if the ok is false indicates the receiver is not connected,
+				// so we still sleep for HeartbeatTimeout interval?
+				// can we sleep for a short time?
 				if ok {
 					if !reply.Success {
 						if reply.Term > serverArgs.Term {
@@ -639,35 +649,46 @@ func (rf *Raft) sendHeartbeat(term int) {
 							return
 						} else {
 							rf.mu.Lock()
+							// if the prevLogIndex entry is not match,the leader needs to decrease the matchIndex.
+							// Why this happened in the heartbeat process?
+							// Because if the leader doesn't commit an entry next,
+							// the log can't be sent to the follower.
+							// So we firstly to communicate the matchIndex state with the receiver.
+							// And when the matchIndex matches,we can send entries to the receiver.
 							rf.matchIndex[serverId] = maxInt(serverArgs.PrevLogIndex-DecrementSpeed, 0)
 							rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
 							rf.mu.Unlock()
+							// We sleep HeartbeatTimeout because there is no need to communicate as soon as possible
+							// and also in order to avoid the conflict with the AppendEntry RPC.
 							time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 							continue
 						}
-					} else {
-						rf.mu.Lock()
-						if rf.nextIndex[serverId] <= len(rf.log)-1 {
-							serverArgs.PrevLogIndex = rf.matchIndex[serverId]
-							serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex].Term
-							entryArgs := serverArgs
-							idx := rf.nextIndex[serverId]
-							for idx < len(rf.log) {
-								entryArgs.Entries = append(entryArgs.Entries, rf.log[idx])
-								idx++
-							}
-							reply = AppendEntriesReply{}
-							rf.mu.Unlock()
-							ok := rf.sendAppendEntries(serverId, &entryArgs, &reply)
-							if ok && reply.Success {
-								rf.mu.Lock()
-								rf.matchIndex[serverId] = idx - 1
-								rf.nextIndex[serverId] = idx
-								rf.mu.Unlock()
-							}
-						} else {
+					}
+
+					// reply.Success is true means the matchIndex match with the receiver.
+					// So we can send all following entries to the receiver.
+					// If failed,don't need to retry,because this process can happen in the next heartbeat.
+					rf.mu.Lock()
+					if rf.nextIndex[serverId] <= len(rf.log)-1 {
+						serverArgs.PrevLogIndex = rf.matchIndex[serverId]
+						serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex].Term
+						entryArgs := serverArgs
+						idx := rf.nextIndex[serverId]
+						for idx < len(rf.log) {
+							entryArgs.Entries = append(entryArgs.Entries, rf.log[idx])
+							idx++
+						}
+						reply = AppendEntriesReply{}
+						rf.mu.Unlock()
+						ok := rf.sendAppendEntries(serverId, &entryArgs, &reply)
+						if ok && reply.Success {
+							rf.mu.Lock()
+							rf.matchIndex[serverId] = idx - 1
+							rf.nextIndex[serverId] = idx
 							rf.mu.Unlock()
 						}
+					} else {
+						rf.mu.Unlock()
 					}
 				}
 				time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
@@ -690,25 +711,24 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 	count := int32(1)
 
 	for id := range rf.peers {
-		server := id
-		if server == rf.me {
+		if id == rf.me {
 			continue
 		}
-		go func() {
+		go func(server int) {
 			for {
 				args := AppendEntriesArgs{}
 				args.Term = term
 
 				rf.mu.Lock()
+				// verify peer's state to terminate the useless goroutine
 				if rf.state != StateLeader {
 					rf.mu.Unlock()
 					return
 				}
 
-				// Raft already has new Entry
-				// Confirm the tryToCommitEntry have the same entries
-				// also confirm the matchIndex is the same
-
+				// the leader already has a new Entry to be committed
+				// so the old entry's goroutine can be terminated.
+				// because the new entry's goroutine can be responsible for sending the all entries.
 				if entry.Index < len(rf.log)-1 {
 					rf.mu.Unlock()
 					return
@@ -735,11 +755,13 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				reply := AppendEntriesReply{}
 
 				ok := rf.sendAppendEntries(server, &args, &reply)
+				// TODO:
+				// if the receiver in not connected,we need to retry.
 				if !ok {
-					time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
+					time.Sleep(time.Millisecond * 50)
 					continue
 				}
-				// because other has bigger than me
+
 				if reply.Term > args.Term {
 					rf.mu.Lock()
 					rf.becomeFollower(reply.Term)
@@ -752,8 +774,10 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 					rf.matchIndex[server] = maxInt(args.PrevLogIndex-DecrementSpeed, 0)
 					rf.nextIndex[server] = rf.matchIndex[server] + 1
 					rf.mu.Unlock()
-					// in order to avoid hunger goroutines
-					//time.Sleep(time.Millisecond*10)
+					// because the matchIndex entry conflicts,so we need to retry to send.
+					// here we sleep for a short interval in order to reach the consistence quickly.
+					// if we not sleep,goroutine's starvation may occur because of the lock held by other goroutine.
+					time.Sleep(time.Millisecond * 5)
 					continue
 				}
 
@@ -764,10 +788,11 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				}
 				rf.mu.Unlock()
 
-				// don't need to verify the rf's role
-				// even if the rf is a Follower currently
-				// the log has already spread the majority of the peers
-				// the Leader elected after that must have this new log
+				// don't need to verify the peer's state even if the peer isn't leader now.
+				// because the log has already spread the majority of the peers.
+				// If the leader election happens after the log spread,the new leader must have this new log.
+				// If the leader election happens before the log spread,the count > len(peers)/2 must be false.
+				// Detailed explain is in Section 5.4.3 and Figure 9.
 				atomic.AddInt32(&count, 1)
 				if int(count) > len(rf.peers)/2 {
 					commitIndex := args.PrevLogIndex + len(args.Entries)
@@ -780,7 +805,7 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 						return
 					}
 
-					// Leader commit entries
+					// leader commits entries here.
 					for idx <= commitIndex {
 						msg := ApplyMsg{}
 						msg.CommandValid = true
@@ -790,11 +815,12 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 						idx++
 					}
 					rf.mu.Unlock()
+					// avoid the committing process happens again.
 					atomic.AddInt32(&count, -count)
 				}
 				return
 			}
-		}()
+		}(id)
 	}
 }
 
@@ -825,6 +851,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 
 	rf.state = StateFollower
+	// the log[0] is a base log for communicating with other peers.
 	rf.log = make([]Entry, 1)
 	rf.log[0].Index = 0
 	rf.log[0].Term = 0
@@ -833,7 +860,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	rf.globalHeartBeat = time.Now()
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
@@ -862,6 +889,7 @@ func PDebug(lineno string, arg interface{}) {
 	}
 }
 
+// print the file name and line number
 func file_line() string {
 	_, fileName, fileLine, ok := runtime.Caller(1)
 	fileName = filepath.Base(fileName)
@@ -872,4 +900,14 @@ func file_line() string {
 		s = ""
 	}
 	return s
+}
+
+const IsTimeMeasure = false
+
+// for measuring the time elapsed
+func Elapsed(hint string, start *time.Time, rf *Raft) {
+	if IsTimeMeasure {
+		fmt.Printf("%s leader:%d elapsed:%s term:%d\n", hint, rf.me, time.Since(*start), rf.currentTerm)
+		*start = time.Now()
+	}
 }
