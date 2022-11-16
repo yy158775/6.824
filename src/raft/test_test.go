@@ -8,12 +8,17 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
+import (
+	"log"
+	"net/http"
+	"testing"
+)
 import "fmt"
 import "time"
 import "math/rand"
 import "sync/atomic"
 import "sync"
+import _ "net/http/pprof"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -801,6 +806,10 @@ func TestUnreliableAgree2C(t *testing.T) {
 }
 
 func TestFigure8Unreliable2C(t *testing.T) {
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
 	servers := 5
 	cfg := make_config(t, servers, true, false)
 	defer cfg.cleanup()
@@ -816,7 +825,9 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 		leader := -1
 		for i := 0; i < servers; i++ {
+			fmt.Printf("Start:%d %+v\n", i,cfg.rafts[i])
 			_, _, ok := cfg.rafts[i].Start(rand.Int() % 10000)
+			fmt.Printf(" Finished:%d\n", i)
 			if ok && cfg.connected[i] {
 				leader = i
 			}
@@ -832,6 +843,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 
 		if leader != -1 && (rand.Int()%1000) < int(RaftElectionTimeout/time.Millisecond)/2 {
 			cfg.disconnect(leader)
+			fmt.Printf("iters:%d leader:%d disconnect\n", iters, leader)
 			nup -= 1
 		}
 
@@ -839,9 +851,11 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			s := rand.Int() % servers
 			if cfg.connected[s] == false {
 				cfg.connect(s)
+				fmt.Printf("iters:%d leader:%d Connect\n", iters, s)
 				nup += 1
 			}
 		}
+		fmt.Printf("iters:%d\n", iters)
 	}
 
 	for i := 0; i < servers; i++ {
@@ -850,6 +864,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 	}
 
+	fmt.Println("final commit")
 	cfg.one(rand.Int()%10000, servers, true)
 
 	cfg.end()

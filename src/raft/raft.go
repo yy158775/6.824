@@ -49,8 +49,8 @@ const (
 // HeartbeatTimeout is the timeout for the heartbeat of the Leader sent to the follower
 // the tester limits you to 10 heartbeats per second
 const (
-	ElectionTimeoutBase  int = 500
-	ElectionTimeoutRange int = 700
+	ElectionTimeoutBase  int = 400
+	ElectionTimeoutRange int = 400
 	HeartbeatTimeout     int = 150
 )
 
@@ -223,74 +223,76 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 }
 
 type InstallSnapshotArgs struct {
-	term              int
-	leadId            int
-	lastIncludedIndex int
-	lastIncludedTerm  int
-	offset            int
-	data              []byte
-	done              bool
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotReply struct {
+	ReplyTerm int
 }
 
 // send the entire snapshot in a single InstallSnapshot.
 // Don't implement Figure 13's offset mechanism
-func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, replyTerm *int) {
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	*replyTerm = rf.currentTerm
-	if rf.currentTerm > args.term {
+	reply.ReplyTerm = rf.currentTerm
+	if rf.currentTerm > args.Term {
+		rf.mu.Unlock()
 		return
 	}
+	defer PDebug(file_line(), reply)
+	defer PDebug(file_line(), args)
+	defer PDebug(file_line(), rf)
 
-	if args.offset == 0 {
-		rf.snapshot = make([]byte, 0)
-	}
-
-	rf.snapshot = rf.snapshot[:args.offset]
-	rf.snapshot = append(rf.snapshot, args.data...)
-
-	if !args.done {
-		return
-	}
+	rf.snapshot = args.Data
 
 	defer func() {
+		rf.mu.Unlock()
 		// save snapshot file,discard any existing or partial snapshot
 		// with a smaller index
-		rf.Snapshot(args.lastIncludedIndex, rf.snapshot)
+		rf.Snapshot(args.LastIncludedIndex, rf.snapshot)
 		// reset state machine using snapshot contents
-		go func() {
-			applyMsg := ApplyMsg{
-				SnapshotValid: true,
-				Snapshot:      rf.snapshot,
-				SnapshotTerm:  args.lastIncludedTerm,
-				SnapshotIndex: args.lastIncludedIndex,
-			}
-			rf.applyCh <- applyMsg
-		}()
+		//go func() {
+		//	rf.mu.Lock()
+		//	applyMsg := ApplyMsg{
+		//		SnapshotValid: true,
+		//		Snapshot:      rf.snapshot,
+		//		SnapshotTerm:  args.LastIncludedTerm,
+		//		SnapshotIndex: args.LastIncludedIndex,
+		//	}
+		//	rf.applyCh <- applyMsg
+		//	rf.mu.Unlock()
+		//}()
 	}()
 
+	// if the snapshot follow behind the peer ????
 	size := len(rf.log)
-	if size-1 >= args.lastIncludedIndex-rf.X {
-		if rf.log[args.lastIncludedIndex-rf.X].Term == args.lastIncludedTerm {
-			rf.log = rf.log[:args.lastIncludedIndex-rf.X]
+	if size-1 >= args.LastIncludedIndex-rf.X && args.LastIncludedIndex-rf.X >= 0 {
+		if rf.log[args.LastIncludedIndex-rf.X].Term == args.LastIncludedTerm {
+			rf.log = rf.log[args.LastIncludedIndex-rf.X:]
 			return
 		}
 	}
 
 	//discard entire log
 	rf.log = make([]Entry, 1)
-	rf.log[0].Index = args.lastIncludedIndex
-	rf.log[0].Term = args.lastIncludedTerm
+	rf.log[0].Index = args.LastIncludedIndex
+	rf.log[0].Term = args.LastIncludedTerm
 
-	rf.X = args.lastIncludedIndex
+	rf.X = args.LastIncludedIndex
 }
 
 // have the leader send an InstallSnapshot RPC if it doesn't have the log entries
 // required to bring a follower up to date.
 // send the entire snapshot in a single InstallSnapshot.
 // Don't implement Figure 13's offset mechanism.
-func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, replyTerm *int) bool {
-	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, replyTerm)
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -302,9 +304,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if index <= rf.X {
-		return
-	}
 
 	rf.log = rf.log[index-rf.X:]
 	rf.X = index
@@ -730,20 +729,19 @@ func (rf *Raft) sendHeartbeat(term int) {
 
 	args.Term = term
 	args.LeadId = rf.me
-	for id := range rf.peers {
-		go func(serverId int) {
-			for rf.killed() == false {
-				rf.mu.Lock()
-				// terminate the useless heartbeat goroutine
-				// if the peer's state has changed
-				if rf.state != StateLeader || rf.currentTerm != args.Term {
-					rf.mu.Unlock()
-					return
-				}
-				serverArgs := args
-				serverArgs.LeaderCommit = rf.commitIndex
-				rf.mu.Unlock()
 
+	for rf.killed() == false {
+		rf.mu.Lock()
+		// terminate the useless heartbeat goroutine
+		// if the peer's state has changed
+		if rf.state != StateLeader || rf.currentTerm != args.Term {
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+
+		for id := range rf.peers {
+			go func(serverId int) {
 				// even if here the peer is not the leader,
 				// sending one more heartbeat doesn't affect the cluster's state
 				// because of the serverArgs term is not changed.
@@ -752,11 +750,12 @@ func (rf *Raft) sendHeartbeat(term int) {
 					rf.mu.Lock()
 					rf.heartBeat = true
 					rf.mu.Unlock()
-					time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
-					continue
+					return
 				}
 
 				rf.mu.Lock()
+				serverArgs := args
+				serverArgs.LeaderCommit = rf.commitIndex
 				serverArgs.PrevLogIndex = rf.matchIndex[serverId]
 				serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex-rf.X].Term
 				rf.mu.Unlock()
@@ -788,30 +787,31 @@ func (rf *Raft) sendHeartbeat(term int) {
 							// rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
 							rf.mu.Lock()
 							// send snapshot
-							if rf.nextIndex[serverId]-DecrementSpeed <= rf.X {
+							if serverArgs.PrevLogIndex-DecrementSpeed < rf.X {
 								snapshotArgs := InstallSnapshotArgs{}
-								snapshotArgs.lastIncludedIndex = rf.log[0].Index
-								snapshotArgs.lastIncludedTerm = rf.log[0].Term
-								snapshotArgs.data = rf.snapshot
-								snapshotArgs.done = true
-								snapshotArgs.offset = 0
-								snapshotArgs.term = rf.currentTerm
-								snapshotArgs.leadId = rf.me
+								snapshotArgs.LastIncludedIndex = rf.log[0].Index
+								snapshotArgs.LastIncludedTerm = rf.log[0].Term
+								snapshotArgs.Data = rf.snapshot
+								snapshotArgs.Done = true
+								snapshotArgs.Offset = 0
+								snapshotArgs.Term = rf.currentTerm
+								snapshotArgs.LeaderId = rf.me
 								rf.mu.Unlock()
-								replyTerm := 0
-								ok := rf.sendInstallSnapshot(serverId, &snapshotArgs, &replyTerm)
+								snapshotReply := InstallSnapshotReply{}
+								ok := rf.sendInstallSnapshot(serverId, &snapshotArgs, &snapshotReply)
 								if ok {
 									rf.mu.Lock()
-									if replyTerm > rf.currentTerm {
-										rf.becomeFollower(replyTerm)
+									if snapshotReply.ReplyTerm > rf.currentTerm {
+										rf.becomeFollower(snapshotReply.ReplyTerm)
 										rf.mu.Unlock()
 										return
 									}
 									// date race
 									// rf.matchIndex[serverId] = rf.log[0].Index
-									rf.matchIndex[serverId] = serverArgs.PrevLogIndex
+									rf.matchIndex[serverId] = snapshotArgs.LastIncludedIndex
 									rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
 									rf.mu.Unlock()
+									// after install snapshot to send entries
 								} else {
 									// prepare for next heartbeat
 									rf.mu.Lock()
@@ -825,11 +825,13 @@ func (rf *Raft) sendHeartbeat(term int) {
 								rf.matchIndex[serverId] = serverArgs.PrevLogIndex - DecrementSpeed
 								rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
 								rf.mu.Unlock()
+								// wait the next matchIndex
+								return
 							}
 							// We sleep HeartbeatTimeout because there is no need to communicate as soon as possible
 							// and also in order to avoid the conflict with the AppendEntry RPC.
-							time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
-							continue
+							//time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
+							//continue
 						}
 					}
 
@@ -846,8 +848,8 @@ func (rf *Raft) sendHeartbeat(term int) {
 							entryArgs.Entries = append(entryArgs.Entries, rf.log[idx-rf.X])
 							idx++
 						}
-						reply = AppendEntriesReply{}
 						rf.mu.Unlock()
+						reply = AppendEntriesReply{}
 						ok := rf.sendAppendEntries(serverId, &entryArgs, &reply)
 
 						if ok {
@@ -869,9 +871,9 @@ func (rf *Raft) sendHeartbeat(term int) {
 						rf.mu.Unlock()
 					}
 				}
-				time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
-			}
-		}(id)
+			}(id)
+		}
+		time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 	}
 }
 
@@ -936,7 +938,7 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				ok := rf.sendAppendEntries(serverId, &args, &reply)
 				// if the receiver in not connected,we need to retry.
 				if !ok {
-					time.Sleep(time.Millisecond * 100)
+					time.Sleep(time.Millisecond * 10)
 					continue
 				}
 
@@ -956,26 +958,26 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 					// error logical
 					// rf.X = 0
 					// send snapshot
-					if rf.nextIndex[serverId]-DecrementSpeed <= rf.X {
+					if args.PrevLogIndex-DecrementSpeed < rf.X {
 						snapshotArgs := InstallSnapshotArgs{}
-						snapshotArgs.lastIncludedIndex = rf.log[0].Index
-						snapshotArgs.lastIncludedTerm = rf.log[0].Term
-						snapshotArgs.data = rf.snapshot
-						snapshotArgs.done = true
-						snapshotArgs.offset = 0
-						snapshotArgs.term = rf.currentTerm
-						snapshotArgs.leadId = rf.me
+						snapshotArgs.LastIncludedIndex = rf.log[0].Index
+						snapshotArgs.LastIncludedTerm = rf.log[0].Term
+						snapshotArgs.Data = rf.snapshot
+						snapshotArgs.Done = true
+						snapshotArgs.Offset = 0
+						snapshotArgs.Term = rf.currentTerm
+						snapshotArgs.LeaderId = rf.me
 						rf.mu.Unlock()
-						replyTerm := 0
-						ok := rf.sendInstallSnapshot(serverId, &snapshotArgs, &replyTerm)
+						reply := InstallSnapshotReply{}
+						ok := rf.sendInstallSnapshot(serverId, &snapshotArgs, &reply)
 						if ok {
 							rf.mu.Lock()
-							if replyTerm > rf.currentTerm {
-								rf.becomeFollower(replyTerm)
+							if reply.ReplyTerm > snapshotArgs.Term {
+								rf.becomeFollower(reply.ReplyTerm)
 								rf.mu.Unlock()
 								return
 							}
-							rf.matchIndex[serverId] = args.PrevLogIndex
+							rf.matchIndex[serverId] = snapshotArgs.LastIncludedIndex
 							rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
 							rf.mu.Unlock()
 						} else {
@@ -1105,8 +1107,6 @@ func maxInt(a, b int) int {
 	return b
 }
 
-const IsDebug = false
-
 func PDebug(lineno string, arg interface{}) {
 	if IsDebug {
 		fmt.Printf("%s  %+v\n", lineno, arg)
@@ -1126,6 +1126,7 @@ func file_line() string {
 	return s
 }
 
+const IsDebug = true
 const IsTimeMeasure = false
 
 // for measuring the time elapsed
