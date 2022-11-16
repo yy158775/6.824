@@ -49,8 +49,8 @@ const (
 // HeartbeatTimeout is the timeout for the heartbeat of the Leader sent to the follower
 // the tester limits you to 10 heartbeats per second
 const (
-	ElectionTimeoutBase  int = 600
-	ElectionTimeoutRange int = 500
+	ElectionTimeoutBase  int = 500
+	ElectionTimeoutRange int = 700
 	HeartbeatTimeout     int = 150
 )
 
@@ -59,7 +59,7 @@ const (
 // TODO:
 // Forward searching to find the previous log
 // because the the number of log is not specific.
-const DecrementSpeed int = 50
+const DecrementSpeed int = 100
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -113,6 +113,8 @@ type Raft struct {
 	// true indicates the peer has received heartbeat in the past period of time.
 	heartBeat bool
 
+	X        int
+	snapshot []byte
 	// globalHeartBeat is for measuring time interval only used in tests.
 	// such as the goroutine running's time interval or receiving heartbeat's time interval
 	globalHeartBeat time.Time
@@ -205,6 +207,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = term
 		rf.votedFor = voteFor
 		rf.log = log
+		rf.X = rf.log[0].Index
 	}
 }
 
@@ -219,13 +222,121 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
+type InstallSnapshotArgs struct {
+	term              int
+	leadId            int
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	offset            int
+	data              []byte
+	done              bool
+}
+
+// send the entire snapshot in a single InstallSnapshot.
+// Don't implement Figure 13's offset mechanism
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, replyTerm *int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	*replyTerm = rf.currentTerm
+	if rf.currentTerm > args.term {
+		return
+	}
+
+	if args.offset == 0 {
+		rf.snapshot = make([]byte, 0)
+	}
+
+	rf.snapshot = rf.snapshot[:args.offset]
+	rf.snapshot = append(rf.snapshot, args.data...)
+
+	if !args.done {
+		return
+	}
+
+	defer func() {
+		// save snapshot file,discard any existing or partial snapshot
+		// with a smaller index
+		rf.Snapshot(args.lastIncludedIndex, rf.snapshot)
+		// reset state machine using snapshot contents
+		go func() {
+			applyMsg := ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.snapshot,
+				SnapshotTerm:  args.lastIncludedTerm,
+				SnapshotIndex: args.lastIncludedIndex,
+			}
+			rf.applyCh <- applyMsg
+		}()
+	}()
+
+	size := len(rf.log)
+	if size-1 >= args.lastIncludedIndex-rf.X {
+		if rf.log[args.lastIncludedIndex-rf.X].Term == args.lastIncludedTerm {
+			rf.log = rf.log[:args.lastIncludedIndex-rf.X]
+			return
+		}
+	}
+
+	//discard entire log
+	rf.log = make([]Entry, 1)
+	rf.log[0].Index = args.lastIncludedIndex
+	rf.log[0].Term = args.lastIncludedTerm
+
+	rf.X = args.lastIncludedIndex
+}
+
+// have the leader send an InstallSnapshot RPC if it doesn't have the log entries
+// required to bring a follower up to date.
+// send the entire snapshot in a single InstallSnapshot.
+// Don't implement Figure 13's offset mechanism.
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, replyTerm *int) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, replyTerm)
+	return ok
+}
+
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index <= rf.X {
+		return
+	}
 
+	rf.log = rf.log[index-rf.X:]
+	rf.X = index
+
+	for idx := range rf.matchIndex {
+		rf.matchIndex[idx] = rf.log[0].Index
+		rf.nextIndex[idx] = rf.matchIndex[idx] + 1
+	}
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	err := e.Encode(rf.currentTerm)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	err = e.Encode(rf.votedFor)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	err = e.Encode(rf.log)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	data := w.Bytes()
+	if len(snapshot) == 0 {
+		rf.persister.SaveStateAndSnapshot(data, nil)
+	} else {
+		rf.persister.SaveStateAndSnapshot(data, snapshot)
+	}
 }
 
 //
@@ -258,6 +369,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	defer PDebug(file_line(), reply)
+	defer PDebug(file_line(), args)
+	defer PDebug(file_line(), rf)
+
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -278,7 +393,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 
-		if rfLastTerm == args.LastLogTerm && args.LastLogIndex < len(rf.log)-1 {
+		if rfLastTerm == args.LastLogTerm && args.LastLogIndex-rf.X < len(rf.log)-1 {
 			return
 		}
 
@@ -347,6 +462,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	defer PDebug(file_line(), rf)
+	defer PDebug(file_line(), args)
+	defer PDebug(file_line(), reply)
+
 	defer func() {
 		// if the leaderCommit > commitIndex,set
 		// commitIndex = min(leaderCommit,index of the last new entry).
@@ -372,7 +491,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					msg := ApplyMsg{}
 					msg.CommandValid = true
 					msg.CommandIndex = idx
-					msg.Command = rf.log[idx].Date
+					msg.Command = rf.log[idx-rf.X].Date
 					rf.applyCh <- msg
 					idx++
 				}
@@ -410,15 +529,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	size := len(rf.log)
 
 	// lack of new entries
-	if args.PrevLogIndex > size-1 {
+	if args.PrevLogIndex-rf.X > size-1 {
+		reply.Success = false
+		return
+	}
+
+	if args.PrevLogIndex-rf.X < 0 {
 		reply.Success = false
 		return
 	}
 
 	// PrevLogIndex's log conflicts with a new one
 	// delete the existing entry and all that follow it.
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		rf.log = rf.log[:args.PrevLogIndex]
+	if rf.log[args.PrevLogIndex-rf.X].Term != args.PrevLogTerm {
+		rf.log = rf.log[:args.PrevLogIndex-rf.X]
 		rf.persist()
 		reply.Success = false
 		return
@@ -427,9 +551,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if reply.Success {
 		// Append new entries to the receiver's log.
 		for _, entry := range args.Entries {
-			if entry.Index <= len(rf.log)-1 {
-				if rf.log[entry.Index].Term != entry.Term {
-					rf.log = rf.log[:entry.Index]
+			if entry.Index-rf.X <= len(rf.log)-1 {
+				if rf.log[entry.Index-rf.X].Term != entry.Term {
+					rf.log = rf.log[:entry.Index-rf.X]
 					rf.log = append(rf.log, entry)
 				}
 			} else {
@@ -476,7 +600,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	logSize := len(rf.log)
-	index = logSize
+	index = logSize + rf.X
 
 	entry := Entry{}
 	entry.Date = command
@@ -545,6 +669,9 @@ func (rf *Raft) ticker() {
 		args.CandidateId = rf.me
 		count := int32(1)
 
+		PDebug(file_line(), rf)
+		PDebug(file_line(), args)
+
 		for id := range rf.peers {
 			if id == rf.me {
 				continue
@@ -582,8 +709,8 @@ func (rf *Raft) ticker() {
 				if int(count) > len(rf.peers)/2 {
 					rf.state = StateLeader
 					for sid := range rf.matchIndex {
-						rf.matchIndex[sid] = len(rf.log) - 1
-						rf.nextIndex[sid] = len(rf.log)
+						rf.matchIndex[sid] = len(rf.log) - 1 + rf.X
+						rf.nextIndex[sid] = rf.matchIndex[sid] + 1
 					}
 					// immediately send heartbeats
 					go rf.sendHeartbeat(rf.currentTerm)
@@ -631,7 +758,7 @@ func (rf *Raft) sendHeartbeat(term int) {
 
 				rf.mu.Lock()
 				serverArgs.PrevLogIndex = rf.matchIndex[serverId]
-				serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex].Term
+				serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex-rf.X].Term
 				rf.mu.Unlock()
 
 				reply := AppendEntriesReply{}
@@ -648,16 +775,57 @@ func (rf *Raft) sendHeartbeat(term int) {
 							rf.mu.Unlock()
 							return
 						} else {
-							rf.mu.Lock()
 							// if the prevLogIndex entry is not match,the leader needs to decrease the matchIndex.
 							// Why this happened in the heartbeat process?
 							// Because if the leader doesn't commit an entry next,
 							// the log can't be sent to the follower.
 							// So we firstly to communicate the matchIndex state with the receiver.
 							// And when the matchIndex matches,we can send entries to the receiver.
-							rf.matchIndex[serverId] = maxInt(serverArgs.PrevLogIndex-DecrementSpeed, 0)
-							rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
-							rf.mu.Unlock()
+
+							// avoid to update
+							// because it will change the meaning
+							// rf.matchIndex[serverId] = maxInt(serverArgs.PrevLogIndex-DecrementSpeed, 0)
+							// rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+							rf.mu.Lock()
+							// send snapshot
+							if rf.nextIndex[serverId]-DecrementSpeed <= rf.X {
+								snapshotArgs := InstallSnapshotArgs{}
+								snapshotArgs.lastIncludedIndex = rf.log[0].Index
+								snapshotArgs.lastIncludedTerm = rf.log[0].Term
+								snapshotArgs.data = rf.snapshot
+								snapshotArgs.done = true
+								snapshotArgs.offset = 0
+								snapshotArgs.term = rf.currentTerm
+								snapshotArgs.leadId = rf.me
+								rf.mu.Unlock()
+								replyTerm := 0
+								ok := rf.sendInstallSnapshot(serverId, &snapshotArgs, &replyTerm)
+								if ok {
+									rf.mu.Lock()
+									if replyTerm > rf.currentTerm {
+										rf.becomeFollower(replyTerm)
+										rf.mu.Unlock()
+										return
+									}
+									// date race
+									// rf.matchIndex[serverId] = rf.log[0].Index
+									rf.matchIndex[serverId] = serverArgs.PrevLogIndex
+									rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+									rf.mu.Unlock()
+								} else {
+									// prepare for next heartbeat
+									rf.mu.Lock()
+									rf.matchIndex[serverId] = rf.log[0].Index
+									rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+									rf.mu.Unlock()
+								}
+							} else {
+								// need lock because of log may change
+								// matchIndex >= log[0].index
+								rf.matchIndex[serverId] = serverArgs.PrevLogIndex - DecrementSpeed
+								rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+								rf.mu.Unlock()
+							}
 							// We sleep HeartbeatTimeout because there is no need to communicate as soon as possible
 							// and also in order to avoid the conflict with the AppendEntry RPC.
 							time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
@@ -669,23 +837,33 @@ func (rf *Raft) sendHeartbeat(term int) {
 					// So we can send all following entries to the receiver.
 					// If failed,don't need to retry,because this process can happen in the next heartbeat.
 					rf.mu.Lock()
-					if rf.nextIndex[serverId] <= len(rf.log)-1 {
+					if rf.nextIndex[serverId]-rf.X <= len(rf.log)-1 && rf.nextIndex[serverId] > rf.X {
 						serverArgs.PrevLogIndex = rf.matchIndex[serverId]
-						serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex].Term
+						serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex-rf.X].Term
 						entryArgs := serverArgs
 						idx := rf.nextIndex[serverId]
-						for idx < len(rf.log) {
-							entryArgs.Entries = append(entryArgs.Entries, rf.log[idx])
+						for idx-rf.X < len(rf.log) {
+							entryArgs.Entries = append(entryArgs.Entries, rf.log[idx-rf.X])
 							idx++
 						}
 						reply = AppendEntriesReply{}
 						rf.mu.Unlock()
 						ok := rf.sendAppendEntries(serverId, &entryArgs, &reply)
-						if ok && reply.Success {
+
+						if ok {
 							rf.mu.Lock()
-							rf.matchIndex[serverId] = idx - 1
-							rf.nextIndex[serverId] = idx
+							if reply.Term > rf.currentTerm {
+								rf.becomeFollower(reply.Term)
+								rf.mu.Unlock()
+								return
+							}
 							rf.mu.Unlock()
+							if reply.Success {
+								rf.mu.Lock()
+								rf.matchIndex[serverId] = idx - 1
+								rf.nextIndex[serverId] = idx
+								rf.mu.Unlock()
+							}
 						}
 					} else {
 						rf.mu.Unlock()
@@ -714,7 +892,7 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 		if id == rf.me {
 			continue
 		}
-		go func(server int) {
+		go func(serverId int) {
 			for {
 				args := AppendEntriesArgs{}
 				args.Term = term
@@ -729,12 +907,12 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				// the leader already has a new Entry to be committed
 				// so the old entry's goroutine can be terminated.
 				// because the new entry's goroutine can be responsible for sending the all entries.
-				if entry.Index < len(rf.log)-1 {
+				if entry.Index-rf.X < len(rf.log)-1 {
 					rf.mu.Unlock()
 					return
 				}
 
-				if entry.Index <= rf.matchIndex[server] {
+				if entry.Index <= rf.matchIndex[serverId] {
 					rf.mu.Unlock()
 					return
 				}
@@ -742,23 +920,23 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				args.LeaderCommit = rf.commitIndex
 				args.LeadId = rf.me
 
-				args.PrevLogIndex = rf.matchIndex[server]
-				args.PrevLogTerm = rf.log[rf.matchIndex[server]].Term
-				idx := rf.nextIndex[server]
+				args.PrevLogIndex = rf.matchIndex[serverId]
+				args.PrevLogTerm = rf.log[rf.matchIndex[serverId]-rf.X].Term
+				idx := rf.nextIndex[serverId]
 
-				for idx < len(rf.log) {
-					args.Entries = append(args.Entries, rf.log[idx])
+				for idx-rf.X < len(rf.log) {
+					args.Entries = append(args.Entries, rf.log[idx-rf.X])
 					idx++
 				}
 				rf.mu.Unlock()
 
 				reply := AppendEntriesReply{}
 
-				ok := rf.sendAppendEntries(server, &args, &reply)
 				// TODO:
+				ok := rf.sendAppendEntries(serverId, &args, &reply)
 				// if the receiver in not connected,we need to retry.
 				if !ok {
-					time.Sleep(time.Millisecond * 50)
+					time.Sleep(time.Millisecond * 100)
 					continue
 				}
 
@@ -769,11 +947,51 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 					return
 				}
 
+				// same logic in sendHeartbeat
 				if !reply.Success {
 					rf.mu.Lock()
-					rf.matchIndex[server] = maxInt(args.PrevLogIndex-DecrementSpeed, 0)
-					rf.nextIndex[server] = rf.matchIndex[server] + 1
-					rf.mu.Unlock()
+					//rf.matchIndex[serverId] = maxInt(args.PrevLogIndex-DecrementSpeed, rf.X)
+					//rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+
+					// error logical
+					// rf.X = 0
+					// send snapshot
+					if rf.nextIndex[serverId]-DecrementSpeed <= rf.X {
+						snapshotArgs := InstallSnapshotArgs{}
+						snapshotArgs.lastIncludedIndex = rf.log[0].Index
+						snapshotArgs.lastIncludedTerm = rf.log[0].Term
+						snapshotArgs.data = rf.snapshot
+						snapshotArgs.done = true
+						snapshotArgs.offset = 0
+						snapshotArgs.term = rf.currentTerm
+						snapshotArgs.leadId = rf.me
+						rf.mu.Unlock()
+						replyTerm := 0
+						ok := rf.sendInstallSnapshot(serverId, &snapshotArgs, &replyTerm)
+						if ok {
+							rf.mu.Lock()
+							if replyTerm > rf.currentTerm {
+								rf.becomeFollower(replyTerm)
+								rf.mu.Unlock()
+								return
+							}
+							rf.matchIndex[serverId] = args.PrevLogIndex
+							rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+							rf.mu.Unlock()
+						} else {
+							// prepare for next heartbeat
+							rf.mu.Lock()
+							// rf.log[0].Index is the same as rf.X
+							rf.matchIndex[serverId] = rf.log[0].Index
+							rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+							rf.mu.Unlock()
+						}
+					} else {
+						rf.mu.Lock()
+						rf.matchIndex[serverId] = maxInt(args.PrevLogIndex-DecrementSpeed, rf.X)
+						rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+						rf.mu.Unlock()
+					}
 					// because the matchIndex entry conflicts,so we need to retry to send.
 					// here we sleep for a short interval in order to reach the consistence quickly.
 					// if we not sleep,goroutine's starvation may occur because of the lock held by other goroutine.
@@ -782,9 +1000,9 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				}
 
 				rf.mu.Lock()
-				if entry.Index > rf.matchIndex[server] {
-					rf.matchIndex[server] = entry.Index
-					rf.nextIndex[server] = entry.Index + 1
+				if entry.Index > rf.matchIndex[serverId] {
+					rf.matchIndex[serverId] = entry.Index
+					rf.nextIndex[serverId] = entry.Index + 1
 				}
 				rf.mu.Unlock()
 
@@ -809,7 +1027,7 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 					for idx <= commitIndex {
 						msg := ApplyMsg{}
 						msg.CommandValid = true
-						msg.Command = rf.log[idx].Date
+						msg.Command = rf.log[idx-rf.X].Date
 						msg.CommandIndex = idx
 						rf.applyCh <- msg
 						idx++
@@ -858,8 +1076,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.matchIndex = make([]int, len(peers))
 	rf.nextIndex = make([]int, len(peers))
+
+	for idx := range rf.nextIndex {
+		rf.nextIndex[idx] = 1
+	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.X = rf.log[0].Index
 	rf.globalHeartBeat = time.Now()
 	// start ticker goroutine to start elections
 	go rf.ticker()
