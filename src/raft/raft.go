@@ -51,7 +51,7 @@ const (
 const (
 	ElectionTimeoutBase  int = 400
 	ElectionTimeoutRange int = 400
-	HeartbeatTimeout     int = 150
+	HeartbeatTimeout     int = 50
 )
 
 // DecrementSpeed is used by Leader's matchIndex[server] to decrease value
@@ -59,7 +59,7 @@ const (
 // TODO:
 // Forward searching to find the previous log
 // because the the number of log is not specific.
-const DecrementSpeed int = 100
+const DecrementSpeed int = 50
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -115,6 +115,10 @@ type Raft struct {
 
 	X        int
 	snapshot []byte
+
+	// used by apply goroutine to apply entry
+	applyCond *sync.Cond
+
 	// globalHeartBeat is for measuring time interval only used in tests.
 	// such as the goroutine running's time interval or receiving heartbeat's time interval
 	globalHeartBeat time.Time
@@ -245,6 +249,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.mu.Unlock()
 		return
 	}
+
 	defer PDebug(file_line(), reply)
 	defer PDebug(file_line(), args)
 	defer PDebug(file_line(), rf)
@@ -257,17 +262,20 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		// with a smaller index
 		rf.Snapshot(args.LastIncludedIndex, rf.snapshot)
 		// reset state machine using snapshot contents
-		//go func() {
-		//	rf.mu.Lock()
-		//	applyMsg := ApplyMsg{
-		//		SnapshotValid: true,
-		//		Snapshot:      rf.snapshot,
-		//		SnapshotTerm:  args.LastIncludedTerm,
-		//		SnapshotIndex: args.LastIncludedIndex,
-		//	}
-		//	rf.applyCh <- applyMsg
-		//	rf.mu.Unlock()
-		//}()
+		go func() {
+			if len(rf.snapshot) == 0 {
+				return
+			}
+			rf.mu.Lock()
+			applyMsg := ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.snapshot,
+				SnapshotTerm:  args.LastIncludedTerm,
+				SnapshotIndex: args.LastIncludedIndex,
+			}
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+		}()
 	}()
 
 	// if the snapshot follow behind the peer ????
@@ -285,6 +293,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.log[0].Term = args.LastIncludedTerm
 
 	rf.X = args.LastIncludedIndex
+
+	// install only happens in follower
+	// so matchIndex don't need to update
 }
 
 // have the leader send an InstallSnapshot RPC if it doesn't have the log entries
@@ -302,15 +313,28 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	// TODO:
+	// Because the applyMsg sent to the channel must
+	// be in order.So the applyCh <- msg must be executed with lock
+	// not true let me think it
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	defer PDebug(file_line(), rf)
+	defer PDebug(file_line()+" index:", index)
+	defer PDebug(file_line(), snapshot)
+
 	rf.log = rf.log[index-rf.X:]
 	rf.X = index
+	rf.snapshot = snapshot
+	// snapshot replace log
+	rf.lastApplied = index
 
-	for idx := range rf.matchIndex {
-		rf.matchIndex[idx] = rf.log[0].Index
-		rf.nextIndex[idx] = rf.matchIndex[idx] + 1
+	if rf.state == StateLeader {
+		for idx := range rf.matchIndex {
+			// matchIndex don't need to update and don't should be used to send to the peer
+			rf.nextIndex[idx] = maxInt(rf.nextIndex[idx], rf.X+1)
+		}
 	}
 
 	w := new(bytes.Buffer)
@@ -478,24 +502,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			// because of the applyCh can be blocked so need to start a new goroutine
 			// and the entry need to be sent in order.
-			go func() {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				commitIndex := minInt(args.PrevLogIndex, args.LeaderCommit)
-				idx := rf.commitIndex + 1
-				if idx > commitIndex {
-					return
-				}
-				for idx <= commitIndex {
-					msg := ApplyMsg{}
-					msg.CommandValid = true
-					msg.CommandIndex = idx
-					msg.Command = rf.log[idx-rf.X].Date
-					rf.applyCh <- msg
-					idx++
-				}
-				rf.commitIndex = commitIndex
-			}()
+			commitIndex := minInt(args.PrevLogIndex, args.LeaderCommit)
+			// first update the rf's commitIndex
+			// to avoid the other RPC to commit the command
+			idx := rf.commitIndex + 1
+			if idx > commitIndex {
+				return
+			}
+			rf.commitIndex = commitIndex
+			rf.applyCond.Signal()
 		}
 	}()
 
@@ -668,8 +683,8 @@ func (rf *Raft) ticker() {
 		args.CandidateId = rf.me
 		count := int32(1)
 
-		PDebug(file_line(), rf)
-		PDebug(file_line(), args)
+		//PDebug(file_line(), rf)
+		//PDebug(file_line(), args)
 
 		for id := range rf.peers {
 			if id == rf.me {
@@ -708,8 +723,9 @@ func (rf *Raft) ticker() {
 				if int(count) > len(rf.peers)/2 {
 					rf.state = StateLeader
 					for sid := range rf.matchIndex {
-						rf.matchIndex[sid] = len(rf.log) - 1 + rf.X
-						rf.nextIndex[sid] = rf.matchIndex[sid] + 1
+						rf.matchIndex[sid] = 0
+						// int the following,we need to avoid nextIndex < rf.X.
+						rf.nextIndex[sid] = len(rf.log) + rf.X
 					}
 					// immediately send heartbeats
 					go rf.sendHeartbeat(rf.currentTerm)
@@ -756,7 +772,7 @@ func (rf *Raft) sendHeartbeat(term int) {
 				rf.mu.Lock()
 				serverArgs := args
 				serverArgs.LeaderCommit = rf.commitIndex
-				serverArgs.PrevLogIndex = rf.matchIndex[serverId]
+				serverArgs.PrevLogIndex = rf.nextIndex[serverId] - 1
 				serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex-rf.X].Term
 				rf.mu.Unlock()
 
@@ -806,26 +822,21 @@ func (rf *Raft) sendHeartbeat(term int) {
 										rf.mu.Unlock()
 										return
 									}
-									// date race
-									// rf.matchIndex[serverId] = rf.log[0].Index
-									rf.matchIndex[serverId] = snapshotArgs.LastIncludedIndex
-									rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+									// currently, the log is inconsistent with the leader's
+									if rf.matchIndex[serverId] == 0 {
+										rf.matchIndex[serverId] = snapshotArgs.LastIncludedIndex
+										rf.nextIndex[serverId] = maxInt(snapshotArgs.LastIncludedIndex+1, rf.X+1)
+									}
 									rf.mu.Unlock()
 									// after install snapshot to send entries
-								} else {
-									// prepare for next heartbeat
-									rf.mu.Lock()
-									rf.matchIndex[serverId] = rf.log[0].Index
-									rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
-									rf.mu.Unlock()
 								}
 							} else {
 								// need lock because of log may change
-								// matchIndex >= log[0].index
-								rf.matchIndex[serverId] = serverArgs.PrevLogIndex - DecrementSpeed
-								rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+								// nextIndex is in decrease progress because the matchIndex is 0
+								if rf.matchIndex[serverId] == 0 {
+									rf.nextIndex[serverId] = maxInt(serverArgs.PrevLogIndex-DecrementSpeed+1, rf.X+1)
+								}
 								rf.mu.Unlock()
-								// wait the next matchIndex
 								return
 							}
 							// We sleep HeartbeatTimeout because there is no need to communicate as soon as possible
@@ -835,18 +846,26 @@ func (rf *Raft) sendHeartbeat(term int) {
 						}
 					}
 
-					// reply.Success is true means the matchIndex match with the receiver.
+					// reply.Success is true means the nextIndex match with the receiver.
 					// So we can send all following entries to the receiver.
 					// If failed,don't need to retry,because this process can happen in the next heartbeat.
 					rf.mu.Lock()
-					if rf.nextIndex[serverId]-rf.X <= len(rf.log)-1 && rf.nextIndex[serverId] > rf.X {
-						serverArgs.PrevLogIndex = rf.matchIndex[serverId]
+					// really need it?
+					if rf.matchIndex[serverId] > serverArgs.PrevLogIndex {
+						rf.mu.Unlock()
+						return
+					}
+					rf.matchIndex[serverId] = serverArgs.PrevLogIndex
+					rf.nextIndex[serverId] = maxInt(serverArgs.PrevLogIndex+1, rf.X+1)
+					nextIdx := serverArgs.PrevLogIndex + 1
+
+					if nextIdx-rf.X <= len(rf.log)-1 && nextIdx > rf.X {
+						serverArgs.PrevLogIndex = rf.nextIndex[serverId] - 1
 						serverArgs.PrevLogTerm = rf.log[serverArgs.PrevLogIndex-rf.X].Term
 						entryArgs := serverArgs
-						idx := rf.nextIndex[serverId]
-						for idx-rf.X < len(rf.log) {
-							entryArgs.Entries = append(entryArgs.Entries, rf.log[idx-rf.X])
-							idx++
+						for nextIdx-rf.X < len(rf.log) {
+							entryArgs.Entries = append(entryArgs.Entries, rf.log[nextIdx-rf.X])
+							nextIdx++
 						}
 						rf.mu.Unlock()
 						reply = AppendEntriesReply{}
@@ -862,8 +881,8 @@ func (rf *Raft) sendHeartbeat(term int) {
 							rf.mu.Unlock()
 							if reply.Success {
 								rf.mu.Lock()
-								rf.matchIndex[serverId] = idx - 1
-								rf.nextIndex[serverId] = idx
+								rf.matchIndex[serverId] = nextIdx - 1
+								rf.nextIndex[serverId] = maxInt(nextIdx, rf.X+1)
 								rf.mu.Unlock()
 							}
 						}
@@ -922,8 +941,9 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				args.LeaderCommit = rf.commitIndex
 				args.LeadId = rf.me
 
-				args.PrevLogIndex = rf.matchIndex[serverId]
-				args.PrevLogTerm = rf.log[rf.matchIndex[serverId]-rf.X].Term
+				args.PrevLogIndex = rf.nextIndex[serverId] - 1
+				args.PrevLogTerm = rf.log[args.PrevLogIndex-rf.X].Term
+
 				idx := rf.nextIndex[serverId]
 
 				for idx-rf.X < len(rf.log) {
@@ -952,11 +972,6 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				// same logic in sendHeartbeat
 				if !reply.Success {
 					rf.mu.Lock()
-					//rf.matchIndex[serverId] = maxInt(args.PrevLogIndex-DecrementSpeed, rf.X)
-					//rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
-
-					// error logical
-					// rf.X = 0
 					// send snapshot
 					if args.PrevLogIndex-DecrementSpeed < rf.X {
 						snapshotArgs := InstallSnapshotArgs{}
@@ -978,20 +993,11 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 								return
 							}
 							rf.matchIndex[serverId] = snapshotArgs.LastIncludedIndex
-							rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
-							rf.mu.Unlock()
-						} else {
-							// prepare for next heartbeat
-							rf.mu.Lock()
-							// rf.log[0].Index is the same as rf.X
-							rf.matchIndex[serverId] = rf.log[0].Index
-							rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+							rf.nextIndex[serverId] = maxInt(snapshotArgs.LastIncludedIndex+1, rf.X+1)
 							rf.mu.Unlock()
 						}
 					} else {
-						rf.mu.Lock()
-						rf.matchIndex[serverId] = maxInt(args.PrevLogIndex-DecrementSpeed, rf.X)
-						rf.nextIndex[serverId] = rf.matchIndex[serverId] + 1
+						rf.nextIndex[serverId] = maxInt(args.PrevLogIndex-DecrementSpeed+1, rf.X+1)
 						rf.mu.Unlock()
 					}
 					// because the matchIndex entry conflicts,so we need to retry to send.
@@ -1004,7 +1010,7 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				rf.mu.Lock()
 				if entry.Index > rf.matchIndex[serverId] {
 					rf.matchIndex[serverId] = entry.Index
-					rf.nextIndex[serverId] = entry.Index + 1
+					rf.nextIndex[serverId] = maxInt(entry.Index+1, rf.X)
 				}
 				rf.mu.Unlock()
 
@@ -1017,23 +1023,16 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				if int(count) > len(rf.peers)/2 {
 					commitIndex := args.PrevLogIndex + len(args.Entries)
 					rf.mu.Lock()
-					idx := rf.commitIndex + 1
 					if rf.commitIndex < commitIndex {
+						// first update the commitIndex
+						// in order to avoid sending command again
 						rf.commitIndex = commitIndex
 					} else {
 						rf.mu.Unlock()
 						return
 					}
 
-					// leader commits entries here.
-					for idx <= commitIndex {
-						msg := ApplyMsg{}
-						msg.CommandValid = true
-						msg.Command = rf.log[idx-rf.X].Date
-						msg.CommandIndex = idx
-						rf.applyCh <- msg
-						idx++
-					}
+					rf.applyCond.Signal()
 					rf.mu.Unlock()
 					// avoid the committing process happens again.
 					atomic.AddInt32(&count, -count)
@@ -1041,6 +1040,35 @@ func (rf *Raft) tryToCommitEntry(term int, entry *Entry) {
 				return
 			}
 		}(id)
+	}
+}
+
+func (rf *Raft) applyEntries() {
+	for {
+		rf.applyCond.L.Lock()
+		for rf.lastApplied == rf.commitIndex {
+			rf.applyCond.Wait()
+		}
+		rf.applyCond.L.Unlock()
+
+		rf.mu.Lock()
+		commitIndex := rf.commitIndex
+		idx := rf.lastApplied + 1
+		PDebug(file_line(), rf)
+		PDebug(file_line(), commitIndex)
+		// idx < rf.X avoid the rf.X changed
+		for idx <= commitIndex && idx > rf.X {
+			msg := ApplyMsg{}
+			msg.CommandValid = true
+			msg.Command = rf.log[idx-rf.X].Date
+			msg.CommandIndex = idx
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			rf.mu.Lock()
+			idx++
+		}
+		rf.lastApplied = maxInt(commitIndex, rf.lastApplied)
+		rf.mu.Unlock()
 	}
 }
 
@@ -1067,8 +1095,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 
+	// if is restarted,does it will apply again and error occur?
+	// Yes.But apply again to restore the state machine is the meaning og log.
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	m := sync.Mutex{}
+	rf.applyCond = sync.NewCond(&m)
 
 	rf.state = StateFollower
 	// the log[0] is a base log for communicating with other peers.
@@ -1079,17 +1111,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 	rf.nextIndex = make([]int, len(peers))
 
-	for idx := range rf.nextIndex {
-		rf.nextIndex[idx] = 1
-	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	rf.X = rf.log[0].Index
+
+	for idx := range rf.nextIndex {
+		rf.matchIndex[idx] = 0
+		rf.nextIndex[idx] = rf.X + 1
+	}
+
 	rf.globalHeartBeat = time.Now()
 	// start ticker goroutine to start elections
+	go rf.applyEntries()
 	go rf.ticker()
-
 	return rf
 }
 
@@ -1126,7 +1161,7 @@ func file_line() string {
 	return s
 }
 
-const IsDebug = true
+const IsDebug = false
 const IsTimeMeasure = false
 
 // for measuring the time elapsed
